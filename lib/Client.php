@@ -8,10 +8,9 @@ use PostHog\Consumer\ForkCurl;
 use PostHog\Consumer\LibCurl;
 use PostHog\Consumer\Socket;
 
-const SIZE_LIMIT = 50_000;
-
 class Client
 {
+    private const SIZE_LIMIT = 50_000;
     private const CONSUMERS = [
         "socket" => Socket::class,
         "file" => File::class,
@@ -100,7 +99,7 @@ class Client
         $this->featureFlags = [];
         $this->groupTypeMapping = [];
         $this->cohorts = [];
-        $this->distinctIdsFeatureFlagsReported = new SizeLimitedHash(SIZE_LIMIT);
+        $this->distinctIdsFeatureFlagsReported = new SizeLimitedHash(self::SIZE_LIMIT);
 
         // Populate featureflags and grouptypemapping if possible
         if (
