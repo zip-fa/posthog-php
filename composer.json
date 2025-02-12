@@ -1,5 +1,5 @@
 {
-	"name": "posthog/posthog-php",
+	"name": "zip-fa/posthog-php",
 	"version": "3.3.2",
 	"description": "PostHog PHP Library",
 	"keywords": [
