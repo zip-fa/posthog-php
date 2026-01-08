@@ -4,7 +4,7 @@ namespace PostHog;
 
 abstract class Consumer
 {
-    protected $type = "Consumer";
+    protected string $type = "Consumer";
 
     protected $options;
     protected $apiKey;
