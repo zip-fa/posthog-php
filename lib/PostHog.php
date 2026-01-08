@@ -6,7 +6,7 @@ use Exception;
 
 class PostHog
 {
-    public const VERSION = '3.0.3';
+    public const VERSION = '3.7.3';
     public const ENV_API_KEY = "POSTHOG_API_KEY";
     public const ENV_HOST = "POSTHOG_HOST";
 
@@ -170,7 +170,31 @@ class PostHog
         );
     }
 
-        /**
+    /**
+     * @param string $key
+     * @param string $distinctId
+     * @param array $groups
+     * @param array $personProperties
+     * @param array $groupProperties
+     * @return mixed
+     */
+    public static function getFeatureFlagPayload(
+        string $key,
+        string $distinctId,
+        array $groups = array(),
+        array $personProperties = array(),
+        array $groupProperties = array(),
+    ): mixed {
+        return self::$client->getFeatureFlagPayload(
+            $key,
+            $distinctId,
+            $groups,
+            $personProperties,
+            $groupProperties
+        );
+    }
+
+    /**
      * get all enabled flags for distinct_id
      *
      * @param string $distinctId
@@ -261,6 +285,20 @@ class PostHog
         self::checkClient();
 
         return self::$client->flush();
+    }
+
+    /**
+     * Get the underlying client instance.
+     * Useful for accessing client-level functionality like loadFlags() or getFlagsEtag().
+     *
+     * @return Client
+     * @throws Exception
+     */
+    public static function getClient(): Client
+    {
+        self::checkClient();
+
+        return self::$client;
     }
 
     private static function cleanHost(?string $host): string

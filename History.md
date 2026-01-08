@@ -1,3 +1,60 @@
+3.7.3 / 2025-12-04
+==================
+
+* feat(flags): Add ETag support for local evaluation caching
+* feat(flags): include `evaluated_at` properties in `$feature_flag_called` events
+
+
+3.7.2 / 2025-10-22
+==================
+
+  * fix(flags): fallback to API for multi-condition flags with static cohorts (#86)
+
+
+3.7.1 / 2025-09-26
+==================
+
+  * fix: don't sort condition sets with variant overrides to the top (#85)
+
+
+3.7.0 / 2025-08-26
+==================
+
+  * feat(flags): Implement local evaluation of flag dependencies (#84)
+  * fix: Ignore new `flag` filter type in local evaluation (#80)
+  * chore: Add feature flags project board workflow (#79)
+
+3.6.0 / 2025-04-30
+==================
+
+  * chore(flags): use new `/flags` endpoint instead of `/decide` (#76)
+
+3.5.0 / 2025-04-17
+==================
+
+  * feat: Add request id, version, id, and evaluation reason to $feature_flag_called events (#75)
+  * Bump version to 3.4.0 (#74)
+3.4.0 / 2025-04-15
+==================
+
+  * feat(flags): Add getFeatureFlagPayload method (#53)
+
+3.3.5 / 2025-03-26
+==================
+
+  * Fix version updating in Makefile (#72)
+
+3.3.4 / 2025-03-11
+==================
+
+  * Add support for 'verify_batch_events_request=>false' (#70)
+  * Run GitHub actions on all supported PHP versions (#67)
+
+3.3.3 / 2025-02-28
+==================
+
+  * Fix PHP 8.4 deprecation on Client.php constructor (Backwards Compatible) (#66)
+
 
 3.3.2 / 2024-04-03
 ==================

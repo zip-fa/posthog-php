@@ -61,11 +61,25 @@ class Client
      */
     public $cohorts;
 
+    /**
+     * @var array
+     */
+    public $featureFlagsByKey;
 
     /**
      * @var SizeLimitedHash
      */
     public $distinctIdsFeatureFlagsReported;
+
+    /**
+     * @var string|null Cached ETag for feature flag definitions
+     */
+    private $flagsEtag;
+
+    /**
+     * @var bool
+     */
+    private $debug;
 
     /**
      * Create a new posthog object with your app's API key
@@ -79,11 +93,12 @@ class Client
         string $apiKey,
         array $options = [],
         ?HttpClient $httpClient = null,
-        string $personalAPIKey = null,
+        ?string $personalAPIKey = null,
         bool $loadFeatureFlags = true,
     ) {
         $this->apiKey = $apiKey;
         $this->personalAPIKey = $personalAPIKey;
+        $this->debug = $options["debug"] ?? false;
         $Consumer = self::CONSUMERS[$options["consumer"] ?? "lib_curl"];
         $this->consumer = new $Consumer($apiKey, $options, $httpClient);
         $this->httpClient = $httpClient !== null ? $httpClient : new HttpClient(
@@ -99,7 +114,9 @@ class Client
         $this->featureFlags = [];
         $this->groupTypeMapping = [];
         $this->cohorts = [];
+        $this->featureFlagsByKey = [];
         $this->distinctIdsFeatureFlagsReported = new SizeLimitedHash(self::SIZE_LIMIT);
+        $this->flagsEtag = null;
 
         // Populate featureflags and grouptypemapping if possible
         if (
@@ -131,28 +148,30 @@ class Client
             $message["properties"]['$groups'] = $message['$groups'];
         }
 
-        $extraProperties = [];
-        $flags = [];
         if (array_key_exists("send_feature_flags", $message) && $message["send_feature_flags"]) {
-            $flags = $this->fetchFeatureVariants($message["distinct_id"], $message["groups"]);
+            $extraProperties = [];
+            $flags = [];
 
-        } elseif (count($this->featureFlags) != 0) {
-            # Local evaluation is enabled, flags are loaded, so try and get all flags we can without going to the server
-            $flags = $this->getAllFlags($message["distinct_id"], $message["groups"], [], [], true);
+            if (count($this->featureFlags) != 0) {
+                # Local evaluation is enabled, flags are loaded, so try and get all flags we can without going to the server
+                $flags = $this->getAllFlags($message["distinct_id"], $message["groups"], [], [], true);
+            } else {
+                $flags = $this->fetchFeatureVariants($message["distinct_id"], $message["groups"]);
+            }
+
+            // Add all feature variants to event
+            foreach ($flags as $flagKey => $flagValue) {
+                $extraProperties[sprintf('$feature/%s', $flagKey)] = $flagValue;
+            }
+            // Add all feature flag keys that aren't false to $active_feature_flags
+            // decide v2 does this automatically, but we need it for when we upgrade to v3
+            $extraProperties['$active_feature_flags'] = array_keys(array_filter($flags, function ($flagValue) {
+                return $flagValue !== false;
+            }));
+
+            $message["properties"] = array_merge($extraProperties, $message["properties"]);
         }
 
-        // Add all feature variants to event
-        foreach ($flags as $flagKey => $flagValue) {
-            $extraProperties[sprintf('$feature/%s', $flagKey)] = $flagValue;
-        }
-
-        // Add all feature flag keys that aren't false to $active_feature_flags
-        // decide v2 does this automatically, but we need it for when we upgrade to v3
-        $extraProperties['$active_feature_flags'] = array_keys(array_filter($flags, function ($flagValue) {
-            return $flagValue !== false;
-        }));
-
-        $message["properties"] = array_merge($extraProperties, $message["properties"]);
 
         return $this->consumer->capture($message);
     }
@@ -240,6 +259,7 @@ class Client
             $groupProperties
         );
         $result = null;
+        $featureFlagError = null;
 
         foreach ($this->featureFlags as $flag) {
             if ($flag["key"] == $key) {
@@ -251,6 +271,8 @@ class Client
                         $personProperties,
                         $groupProperties
                     );
+                } catch (RequiresServerEvaluationException $e) {
+                    $result = null;
                 } catch (InconclusiveMatchException $e) {
                     $result = null;
                 } catch (Exception $e) {
@@ -261,27 +283,85 @@ class Client
         }
 
         $flagWasEvaluatedLocally = !is_null($result);
+        $requestId = null;
+        $evaluatedAt = null;
+        $flagDetail = null;
 
         if (!$flagWasEvaluatedLocally && !$onlyEvaluateLocally) {
             try {
-                $featureFlags = $this->fetchFeatureVariants($distinctId, $groups, $personProperties, $groupProperties);
-                if(array_key_exists($key, $featureFlags)) {
+                $response = $this->fetchFlagsResponse($distinctId, $groups, $personProperties, $groupProperties);
+                $errors = [];
+
+                if (isset($response['errorsWhileComputingFlags']) && $response['errorsWhileComputingFlags']) {
+                    $errors[] = FeatureFlagError::ERRORS_WHILE_COMPUTING_FLAGS;
+                }
+
+                $requestId = isset($response['requestId']) ? $response['requestId'] : null;
+                $evaluatedAt = isset($response['evaluatedAt']) ? $response['evaluatedAt'] : null;
+                $flagDetail = isset($response['flags'][$key]) ? $response['flags'][$key] : null;
+                $featureFlags = $response['featureFlags'] ?? [];
+                if (array_key_exists($key, $featureFlags)) {
                     $result = $featureFlags[$key];
                 } else {
+                    $errors[] = FeatureFlagError::FLAG_MISSING;
                     $result = null;
                 }
+
+                if (!empty($errors)) {
+                    $featureFlagError = implode(',', $errors);
+                }
+            } catch (HttpException $e) {
+                error_log("[PostHog][Client] Unable to get feature variants: " . $e->getMessage());
+                switch ($e->getErrorType()) {
+                    case HttpException::QUOTA_LIMITED:
+                        $featureFlagError = FeatureFlagError::QUOTA_LIMITED;
+                        break;
+                    case HttpException::TIMEOUT:
+                        $featureFlagError = FeatureFlagError::TIMEOUT;
+                        break;
+                    case HttpException::CONNECTION_ERROR:
+                        $featureFlagError = FeatureFlagError::CONNECTION_ERROR;
+                        break;
+                    case HttpException::API_ERROR:
+                        $featureFlagError = FeatureFlagError::apiError($e->getStatusCode());
+                        break;
+                    default:
+                        $featureFlagError = FeatureFlagError::UNKNOWN_ERROR;
+                }
+                $result = null;
             } catch (Exception $e) {
-                error_log("[PostHog][Client] Unable to get feature variants:" . $e->getMessage());
+                error_log("[PostHog][Client] Unable to get feature variants: " . $e->getMessage());
+                $featureFlagError = FeatureFlagError::UNKNOWN_ERROR;
                 $result = null;
             }
         }
 
         if ($sendFeatureFlagEvents && !$this->distinctIdsFeatureFlagsReported->contains($key, $distinctId)) {
+            $properties = [
+                '$feature_flag' => $key,
+                '$feature_flag_response' => $result,
+            ];
+
+            if (!is_null($requestId)) {
+                $properties['$feature_flag_request_id'] = $requestId;
+            }
+
+            if (!is_null($evaluatedAt)) {
+                $properties['$feature_flag_evaluated_at'] = $evaluatedAt;
+            }
+
+            if (!is_null($flagDetail)) {
+                $properties['$feature_flag_id'] = $flagDetail['metadata']['id'];
+                $properties['$feature_flag_version'] = $flagDetail['metadata']['version'];
+                $properties['$feature_flag_reason'] = $flagDetail['reason']['description'];
+            }
+
+            if (!is_null($featureFlagError)) {
+                $properties['$feature_flag_error'] = $featureFlagError;
+            }
+
             $this->capture([
-                "properties" => [
-                    '$feature_flag' => $key,
-                    '$feature_flag_response' => $result,
-                ],
+                "properties" => $properties,
                 "distinct_id" => $distinctId,
                 "event" => '$feature_flag_called',
                 '$groups' => $groups
@@ -293,6 +373,37 @@ class Client
             return $result;
         }
         return null;
+    }
+
+    /**
+     * @param string $key
+     * @param string $distinctId
+     * @param array $groups
+     * @param array $personProperties
+     * @param array $groupProperties
+     * @return mixed
+     */
+    public function getFeatureFlagPayload(
+        string $key,
+        string $distinctId,
+        array $groups = array(),
+        array $personProperties = array(),
+        array $groupProperties = array(),
+    ): mixed {
+        $results = $this->flags($distinctId, $groups, $personProperties, $groupProperties);
+
+        if (isset($results['featureFlags'][$key]) === false || $results['featureFlags'][$key] !== true) {
+            return null;
+        }
+
+        $payload = $results['featureFlagPayloads'][$key] ?? null;
+
+        if ($payload === null) {
+            return null;
+        }
+
+        # feature flag payloads are always JSON encoded strings.
+        return json_decode($payload, true);
     }
 
     /**
@@ -319,7 +430,7 @@ class Client
             $groupProperties
         );
         $response = [];
-        $fallbackToDecide = false;
+        $fallbackToFlags = false;
 
         if (count($this->featureFlags) > 0) {
             foreach ($this->featureFlags as $flag) {
@@ -331,18 +442,20 @@ class Client
                         $personProperties,
                         $groupProperties
                     );
+                } catch (RequiresServerEvaluationException $e) {
+                    $fallbackToFlags = true;
                 } catch (InconclusiveMatchException $e) {
-                    $fallbackToDecide = true;
+                    $fallbackToFlags = true;
                 } catch (Exception $e) {
-                    $fallbackToDecide = true;
+                    $fallbackToFlags = true;
                     error_log("[PostHog][Client] Error while computing variant:" . $e->getMessage());
                 }
             }
         } else {
-            $fallbackToDecide = true;
+            $fallbackToFlags = true;
         }
 
-        if ($fallbackToDecide && !$onlyEvaluateLocally) {
+        if ($fallbackToFlags && !$onlyEvaluateLocally) {
             try {
                 $featureFlags = $this->fetchFeatureVariants($distinctId, $groups, $personProperties, $groupProperties);
                 $response = array_merge($response, $featureFlags);
@@ -361,6 +474,9 @@ class Client
         array $personProperties = array(),
         array $groupProperties = array()
     ): bool | string {
+        // Create evaluation cache for flag dependencies
+        $evaluationCache = [];
+
         if ($featureFlag["ensure_experience_continuity"] ?? false) {
             throw new InconclusiveMatchException("Flag has experience continuity enabled");
         }
@@ -384,9 +500,23 @@ class Client
             }
 
             $focusedGroupProperties = $groupProperties[$groupName];
-            return FeatureFlag::matchFeatureFlagProperties($featureFlag, $groups[$groupName], $focusedGroupProperties);
+            return FeatureFlag::matchFeatureFlagProperties(
+                $featureFlag,
+                $groups[$groupName],
+                $focusedGroupProperties,
+                $this->cohorts,
+                $this->featureFlagsByKey,
+                $evaluationCache
+            );
         } else {
-            return FeatureFlag::matchFeatureFlagProperties($featureFlag, $distinctId, $personProperties, $this->cohorts);
+            return FeatureFlag::matchFeatureFlagProperties(
+                $featureFlag,
+                $distinctId,
+                $personProperties,
+                $this->cohorts,
+                $this->featureFlagsByKey,
+                $evaluationCache
+            );
         }
     }
 
@@ -399,15 +529,27 @@ class Client
      */
     public function fetchFeatureVariants(
         string $distinctId,
-        array $groups = array(),
+        array $groups = [],
         array $personProperties = [],
         array $groupProperties = []
     ): array {
-        $flags = json_decode(
-            $this->decide($distinctId, $groups, $personProperties, $groupProperties),
-            true
-        )['featureFlags'] ?? [];
-        return $flags;
+        $response = $this->fetchFlagsResponse($distinctId, $groups, $personProperties, $groupProperties);
+        return $response['featureFlags'] ?? [];
+    }
+
+    /**
+     * @param string $distinctId
+     * @param array $groups
+     * @return array of feature flags
+     * @throws Exception
+     */
+    private function fetchFlagsResponse(
+        string $distinctId,
+        array $groups = [],
+        array $personProperties = [],
+        array $groupProperties = []
+    ): ?array {
+        return $this->flags($distinctId, $groups, $personProperties, $groupProperties);
     }
 
     /**
@@ -416,38 +558,147 @@ class Client
 
     public function loadFlags()
     {
-        $payload = json_decode($this->localFlags(), true);
+        $response = $this->localFlags();
+
+        // Handle 304 Not Modified - flags haven't changed, skip processing.
+        // On 304, we preserve the existing ETag unless the server sends a new one.
+        // This handles edge cases like server restarts where the server may send
+        // a refreshed ETag even though the content hasn't changed.
+        if ($response->isNotModified()) {
+            if ($response->getEtag()) {
+                $this->flagsEtag = $response->getEtag();
+            }
+            if ($this->debug) {
+                error_log("[PostHog][Client] Flags not modified (304), using cached data");
+            }
+            return;
+        }
+
+        $payload = json_decode($response->getResponse(), true);
 
         if ($payload && array_key_exists("detail", $payload)) {
             throw new Exception($payload["detail"]);
         }
 
+        // On 200 responses, always update ETag (even if null) since we're replacing
+        // the cached flag data. A null ETag means the server doesn't support caching.
+        $this->flagsEtag = $response->getEtag();
+
         $this->featureFlags = $payload['flags'] ?? [];
         $this->groupTypeMapping = $payload['group_type_mapping'] ?? [];
         $this->cohorts = $payload['cohorts'] ?? [];
+
+        // Build flags by key dictionary for dependency resolution
+        $this->featureFlagsByKey = [];
+        foreach ($this->featureFlags as $flag) {
+            $this->featureFlagsByKey[$flag['key']] = $flag;
+        }
     }
 
 
-    public function localFlags()
+    public function localFlags(): HttpResponse
     {
+        $headers = [
+            // Send user agent in the form of {library_name}/{library_version} as per RFC 7231.
+            "User-Agent: posthog-php/" . PostHog::VERSION,
+            "Authorization: Bearer " . $this->personalAPIKey
+        ];
+
+        // Add If-None-Match header if we have a cached ETag
+        if ($this->flagsEtag !== null) {
+            $headers[] = "If-None-Match: " . $this->flagsEtag;
+        }
 
         return $this->httpClient->sendRequest(
             '/api/feature_flag/local_evaluation?send_cohorts&token=' . $this->apiKey,
             null,
+            $headers,
             [
-                // Send user agent in the form of {library_name}/{library_version} as per RFC 7231.
-                "User-Agent: posthog-php/" . PostHog::VERSION,
-                "Authorization: Bearer " . $this->personalAPIKey
+                'includeEtag' => true
             ]
-        )->getResponse();
+        );
     }
 
-    public function decide(
+    /**
+     * Get the current cached ETag for feature flag definitions
+     *
+     * @return string|null
+     */
+    public function getFlagsEtag(): ?string
+    {
+        return $this->flagsEtag;
+    }
+
+    /**
+     * Normalize feature flags response to ensure consistent format.
+     * Decodes JSON, checks for quota limits, and transforms v4 to v3 format.
+     *
+     * @param string $response The raw JSON response
+     * @return array The normalized response
+     * @throws HttpException On invalid JSON or quota limit
+     */
+    private function normalizeFeatureFlags(string $response): array
+    {
+        $decoded = json_decode($response, true);
+
+        if (!is_array($decoded)) {
+            throw new HttpException(
+                HttpException::API_ERROR,
+                0,
+                "Invalid JSON response"
+            );
+        }
+
+        // Check for quota limit in response body
+        if (
+            isset($decoded['quotaLimited'])
+            && is_array($decoded['quotaLimited'])
+            && in_array('feature_flags', $decoded['quotaLimited'])
+        ) {
+            throw new HttpException(
+                HttpException::QUOTA_LIMITED,
+                0,
+                "Feature flags quota limited"
+            );
+        }
+
+        if (isset($decoded['flags']) && !empty($decoded['flags'])) {
+            // This is a v4 response, we need to transform it to a v3 response for backwards compatibility
+            $transformedFlags = [];
+            $transformedPayloads = [];
+            foreach ($decoded['flags'] as $key => $flag) {
+                if ($flag['variant'] !== null) {
+                    $transformedFlags[$key] = $flag['variant'];
+                } else {
+                    $transformedFlags[$key] = $flag['enabled'] ?? false;
+                }
+                if (isset($flag['metadata']['payload'])) {
+                    $transformedPayloads[$key] = $flag['metadata']['payload'];
+                }
+            }
+            $decoded['featureFlags'] = $transformedFlags;
+            $decoded['featureFlagPayloads'] = $transformedPayloads;
+        }
+
+        return $decoded;
+    }
+
+    /**
+     * Fetch feature flags from the PostHog API.
+     *
+     * @param string $distinctId The user's distinct ID
+     * @param array $groups Group identifiers
+     * @param array $personProperties Person properties for flag evaluation
+     * @param array $groupProperties Group properties for flag evaluation
+     * @return array The normalized feature flags response
+     * @throws HttpException On network errors, API errors, or quota limits
+     */
+    public function flags(
         string $distinctId,
         array $groups = array(),
         array $personProperties = [],
         array $groupProperties = []
-    ) {
+    ): array {
         $payload = array(
             'api_key' => $this->apiKey,
             'distinct_id' => $distinctId,
@@ -465,8 +716,8 @@ class Client
             $payload["group_properties"] = $groupProperties;
         }
 
-        return $this->httpClient->sendRequest(
-            '/decide/?v=2',
+        $httpResponse = $this->httpClient->sendRequest(
+            '/flags/?v=2',
             json_encode($payload),
             [
                 // Send user agent in the form of {library_name}/{library_version} as per RFC 7231.
@@ -476,7 +727,42 @@ class Client
                 "shouldRetry" => false,
                 "timeout" => $this->featureFlagsRequestTimeout
             ]
-        )->getResponse();
+        );
+
+        $responseCode = $httpResponse->getResponseCode();
+        $curlErrno = $httpResponse->getCurlErrno();
+
+        if ($responseCode === 0) {
+            // CURLE_OPERATION_TIMEDOUT (28)
+            // https://curl.se/libcurl/c/libcurl-errors.html
+            if ($curlErrno === 28) {
+                throw new HttpException(
+                    HttpException::TIMEOUT,
+                    0,
+                    "Request timed out"
+                );
+            }
+            // Consider everything else a connection error
+            // CURLE_COULDNT_RESOLVE_HOST (6)
+            // CURLE_COULDNT_CONNECT (7)
+            // CURLE_WEIRD_SERVER_REPLY (8)
+            // etc.
+            throw new HttpException(
+                HttpException::CONNECTION_ERROR,
+                0,
+                "Connection error (curl errno: {$curlErrno})"
+            );
+        }
+
+        if ($responseCode >= 400) {
+            throw new HttpException(
+                HttpException::API_ERROR,
+                $responseCode,
+                "API error: HTTP {$responseCode}"
+            );
+        }
+
+        return $this->normalizeFeatureFlags($httpResponse->getResponse());
     }
 
     /**

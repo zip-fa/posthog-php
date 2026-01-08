@@ -6,11 +6,15 @@ class HttpResponse
 {
     private $response;
     private $responseCode;
+    private $etag;
+    private $curlErrno;
 
-    public function __construct($response, $responseCode)
+    public function __construct($response, $responseCode, ?string $etag = null, int $curlErrno = 0)
     {
         $this->response = $response;
         $this->responseCode = $responseCode;
+        $this->etag = $etag;
+        $this->curlErrno = $curlErrno;
     }
 
     /**
@@ -27,5 +31,33 @@ class HttpResponse
     public function getResponseCode()
     {
         return $this->responseCode;
+    }
+
+    /**
+     * @return string|null
+     */
+    public function getEtag(): ?string
+    {
+        return $this->etag;
+    }
+
+    /**
+     * Check if the response is a 304 Not Modified
+     *
+     * @return bool
+     */
+    public function isNotModified(): bool
+    {
+        return $this->responseCode === 304;
+    }
+
+    /**
+     * Get the curl error number (0 if no error)
+     *
+     * @return int
+     */
+    public function getCurlErrno(): int
+    {
+        return $this->curlErrno;
     }
 }
